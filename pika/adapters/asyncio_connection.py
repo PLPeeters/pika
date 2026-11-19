@@ -6,11 +6,13 @@ import asyncio
 import collections
 import contextlib
 import functools
+import inspect
 import logging
 import sys
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence, cast
 
-from pika import spec
+from pika import channel as pika_channel
+from pika import exceptions, frame, spec
 from pika._utils import as_bytes, override
 from pika.adapters import base_connection
 from pika.adapters.utils import connection_workflow, io_services_utils, nbio_interface
@@ -36,11 +38,10 @@ class AsyncioConnection(base_connection.BaseConnection):
     def __init__(
             self,
             parameters: connection.Parameters | None = None,
-            on_open_callback: Callable[[connection.Connection], None] |
-        None = None,
-            on_open_error_callback: Callable[
-                [connection.Connection, BaseException], None] | None = None,
-            on_close_callback: Callable[[connection.Connection, BaseException],
+            on_open_callback: Callable[[AsyncioConnection], None] | None = None,
+            on_open_error_callback: Callable[[AsyncioConnection, BaseException],
+                                             None] | None = None,
+            on_close_callback: Callable[[AsyncioConnection, BaseException],
                                         None] | None = None,
             custom_ioloop: asyncio.AbstractEventLoop |
         nbio_interface.AbstractIOServices | None = None,
@@ -49,16 +50,15 @@ class AsyncioConnection(base_connection.BaseConnection):
         Create a new instance of the AsyncioConnection class, connecting to RabbitMQ automatically.
 
         :param parameters: Connection parameters
-        :param on_open_callback: The method to call when the connection
-            is open
+        :param on_open_callback: Called with this AsyncioConnection when it is open.
         :param on_open_error_callback: Callback (or None) with signature
-            ``(Connection, BaseException) -> None``; called if the connection
+            ``(AsyncioConnection, BaseException) -> None``; called if the connection
             can't be established or connection establishment is interrupted by
-            `Connection.close()`: on_open_error_callback(Connection, exception).
+            `Connection.close()`: on_open_error_callback(AsyncioConnection, exception).
         :param on_close_callback: Callback (or None) with signature
-            ``(Connection, BaseException) -> None``; called when a previously fully
+            ``(AsyncioConnection, BaseException) -> None``; called when a previously fully
             open connection is closed:
-            `on_close_callback(Connection, exception)`, where `exception` is
+            `on_close_callback(AsyncioConnection, exception)`, where `exception` is
             either an instance of `exceptions.ConnectionClosed` if closed by
             user or broker or exception of another type that describes the cause
             of connection failure.
@@ -76,12 +76,14 @@ class AsyncioConnection(base_connection.BaseConnection):
             nbio = _AsyncioIOServicesAdapter(custom_ioloop)
 
         self._publisher: _Publisher | None = None
+        self._consumer_tasks: set[asyncio.Future[Any]] = set()
+        self._stream_termination_task: asyncio.Task[None] | None = None
 
         super().__init__(
             parameters,
-            on_open_callback,
-            on_open_error_callback,
-            on_close_callback,
+            cast(Any, on_open_callback),
+            cast(Any, on_open_error_callback),
+            cast(Any, on_close_callback),
             nbio,
             internal_connection_workflow=internal_connection_workflow)
 
@@ -176,6 +178,47 @@ class AsyncioConnection(base_connection.BaseConnection):
             self._publisher = _Publisher(self)
         return self._publisher.publish(channel, exchange, routing_key, body,
                                        properties, mandatory)
+
+    @override
+    def channel(
+        self,
+        channel_number: int | None = None,
+        on_open_callback: Callable[[_AsyncioChannel], Any] | None = None
+    ) -> _AsyncioChannel:
+        """Create a channel with AsyncioConnection's coroutine consumer support."""
+        return cast(
+            _AsyncioChannel,
+            super().channel(channel_number, cast(Any, on_open_callback)))
+
+    @override
+    def _notify_connection_closed(self, reason: Exception) -> None:
+        if (isinstance(reason, exceptions.ConnectionClosedByClient) and
+                self._consumer_tasks):
+            if self._stream_termination_task is None:
+                self._stream_termination_task = self.ioloop.create_task(
+                    self._notify_after_consumer_tasks(reason))
+            return
+
+        if self._stream_termination_task is not None:
+            self._stream_termination_task.cancel()
+            self._stream_termination_task = None
+        super()._notify_connection_closed(reason)
+
+    async def _notify_after_consumer_tasks(self, reason: Exception) -> None:
+        tasks = tuple(self._consumer_tasks)
+        if tasks:
+            await asyncio.wait(tasks)
+
+        self._stream_termination_task = None
+        super()._notify_connection_closed(reason)
+
+    @override
+    def _create_channel(
+            self, channel_number: int,
+            on_open_callback: Callable[[Channel], Any] | None
+    ) -> _AsyncioChannel:
+        """Create a channel that can schedule coroutine delivery handlers."""
+        return _AsyncioChannel(self, channel_number, on_open_callback)
 
 
 class _PendingPublish:
@@ -336,6 +379,78 @@ class _Publisher:
                 item.future.set_exception(reason)
         self._pending = remaining
         self._wake()
+
+
+class _AsyncioChannel(pika_channel.Channel):
+    """Channel that runs awaitable consumer callbacks as loop tasks."""
+
+    def __init__(self, connection: AsyncioConnection, channel_number: int,
+                 on_open_callback: Callable[[Channel], Any] | None) -> None:
+        super().__init__(connection, channel_number, on_open_callback)
+        self._asyncio_connection = connection
+        self._consumer_tasks: set[asyncio.Future[Any]] = set()
+
+    @override
+    def basic_consume(
+            self,
+            queue: str,
+            on_message_callback: Callable[
+                [Channel, spec.Basic.Deliver, spec.BasicProperties, bytes],
+                Any],
+            auto_ack: bool = False,
+            exclusive: bool = False,
+            consumer_tag: str | None = None,
+            arguments: dict[str, Any] | None = None,
+            callback: Callable[..., Any] | None = None) -> str:
+        return super().basic_consume(queue, cast(Any, on_message_callback),
+                                     auto_ack, exclusive, consumer_tag,
+                                     arguments, callback)
+
+    @override
+    def _on_deliver(self, method_frame: frame.Method,
+                    header_frame: frame.Header, body: bytes) -> None:
+        consumer_tag = method_frame.method.consumer_tag
+        callback = self._consumers.get(consumer_tag)
+        if callback is None or not self.is_open:
+            super()._on_deliver(method_frame, header_frame, body)
+            return
+
+        if not self._is_coroutine_callback(callback):
+            callback(self, method_frame.method, header_frame.properties, body)
+            return
+
+        result = callback(self, method_frame.method, header_frame.properties,
+                          body)
+        if inspect.isawaitable(result):
+            task = asyncio.ensure_future(result,
+                                         loop=self._asyncio_connection.ioloop)
+            self._consumer_tasks.add(task)
+            self._asyncio_connection._consumer_tasks.add(task)
+            task.add_done_callback(self._on_consumer_task_done)
+
+    @staticmethod
+    def _is_coroutine_callback(callback: Callable[..., Any]) -> bool:
+        while isinstance(callback, functools.partial):
+            callback = callback.func
+        return (inspect.iscoroutinefunction(callback) or
+                inspect.iscoroutinefunction(type(callback).__call__))
+
+    def _on_consumer_task_done(self, task: asyncio.Future[Any]) -> None:
+        self._consumer_tasks.discard(task)
+        self._asyncio_connection._consumer_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            LOGGER.error('Coroutine consumer handler failed on %s',
+                         self,
+                         exc_info=(type(error), error, error.__traceback__))
+
+    @override
+    def _cleanup(self) -> None:
+        for task in self._consumer_tasks:
+            task.cancel()
+        super()._cleanup()
 
 
 class _AsyncioIOServicesAdapter(io_services_utils.SocketConnectionMixin,

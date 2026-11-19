@@ -2352,11 +2352,15 @@ class Connection(abc.ABC):
                                    self._error)
         else:
             LOGGER.info('Stack terminated due to %r', self._error)
-            self.callbacks.process(0, self.ON_CONNECTION_CLOSED, self, self,
-                                   self._error)
+            assert self._error is not None
+            self._notify_connection_closed(self._error)
 
         # Reset connection properties
         self._init_connection_state()
+
+    def _notify_connection_closed(self, reason: Exception) -> None:
+        """Dispatch connection-close callbacks after stream teardown."""
+        self.callbacks.process(0, self.ON_CONNECTION_CLOSED, self, self, reason)
 
     def _process_callbacks(self, frame_value: frame.Frame) -> bool:
         """

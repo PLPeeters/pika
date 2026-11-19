@@ -423,6 +423,17 @@ class Channel:
         consumer_tag to the consumer callback. If you do not pass in a consumer_tag, one will be
         automatically generated for you. Returns the consumer tag.
 
+        With `AsyncioConnection`, ``on_message_callback`` may be a coroutine function. Each delivery
+        starts a task in delivery order; tasks can overlap while awaiting and finish in any order.
+        Cancelling the consumer leaves delivered handlers running. Channel or connection cleanup
+        cancels pending handlers; failures are logged and do not cause an acknowledgement or reject.
+        A failed manual-ack handler can therefore keep a delivery outstanding against broker
+        prefetch. A handler that acknowledges after processing also keeps the delivery outstanding
+        while it runs. With ``auto_ack=True``, the broker does not wait for the handler and prefetch
+        does not bound its tasks. An application-requested connection close waits for cancelled
+        handlers to finish before invoking the close callback. A handler that suppresses cancellation
+        can delay that callback; unexpected connection loss still notifies immediately.
+
         For more information on basic_consume, see:
         Tutorial 2 at https://www.rabbitmq.com/getstarted.html
         https://www.rabbitmq.com/confirms.html
