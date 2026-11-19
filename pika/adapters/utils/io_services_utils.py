@@ -720,6 +720,8 @@ class _AsyncTransportBase(AbstractStreamTransport):
         self._state = self._STATE_ACTIVE
         self._tx_buffers: collections.deque[bytes] = collections.deque()
         self._tx_buffered_byte_count = 0
+        # Called after each attempt to send; see `AsyncioConnection.publish`.
+        self._on_write_progress: Callable[[], None] | None = None
 
     @override
     def abort(self) -> None:
@@ -821,19 +823,25 @@ class _AsyncTransportBase(AbstractStreamTransport):
         """
         assert self._sock is not None
 
-        while self._tx_buffers:
-            num_bytes_sent = self._sock.send(self._tx_buffers[0])
+        try:
+            while self._tx_buffers:
+                num_bytes_sent = self._sock.send(self._tx_buffers[0])
 
-            chunk = self._tx_buffers.popleft()
-            if num_bytes_sent < len(chunk):
-                _LOGGER.debug('Partial send, requeing remaining data; %s of %s',
-                              num_bytes_sent, len(chunk))
-                self._tx_buffers.appendleft(chunk[num_bytes_sent:])
+                chunk = self._tx_buffers.popleft()
+                if num_bytes_sent < len(chunk):
+                    _LOGGER.debug(
+                        'Partial send, requeing remaining data; %s of %s',
+                        num_bytes_sent, len(chunk))
+                    self._tx_buffers.appendleft(chunk[num_bytes_sent:])
 
-            self._tx_buffered_byte_count -= num_bytes_sent
-            assert self._tx_buffered_byte_count >= 0, (
-                '_AsyncTransportBase._produce() tx buffer size underflow',
-                self._tx_buffered_byte_count, self._state)
+                self._tx_buffered_byte_count -= num_bytes_sent
+                assert self._tx_buffered_byte_count >= 0, (
+                    '_AsyncTransportBase._produce() tx buffer size underflow',
+                    self._tx_buffered_byte_count, self._state)
+        finally:
+            # Sending usually stops with a "try again" error.
+            if self._on_write_progress is not None:
+                self._on_write_progress()
 
     @_log_exceptions
     def _deactivate(self) -> None:

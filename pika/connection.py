@@ -2558,26 +2558,46 @@ class Connection(abc.ABC):
         :param content: A content frame, which is tuple of properties and body.
         :returns: The marshaled frames, in sending order
         """
-        length = len(content[1])
-        marshaled_body_frames = []
-
         # Marshal everything before any of it is output, so a marshaling error
         # sends nothing.
-        frame_method = frame.Method(channel_number, method_frame)
-        frame_header = frame.Header(channel_number, length, content[0])
-        marshaled_body_frames.append(frame_method.marshal())
-        marshaled_body_frames.append(frame_header.marshal())
+        return (self._marshal_message_head(channel_number, method_frame,
+                                           content[0], len(content[1])) +
+                self._marshal_body(channel_number, content[1]))
 
-        if content[1]:
-            # memoryview slices share the body, so each fragment is copied
-            # once, into its frame.
-            body = memoryview(content[1])
-            for start in range(0, length, self._body_max_length):
-                fragment = body[start:start + self._body_max_length]
-                marshaled_body_frames.append(
-                    frame.marshal_body(channel_number, fragment))
+    def _marshal_message_head(self, channel_number: int,
+                              method_frame: amqp_object.Method,
+                              properties: spec.BasicProperties,
+                              body_size: int) -> list[bytes]:
+        """
+        Marshal a message's method and header frames; see `_marshal_message`.
 
-        return marshaled_body_frames
+        :param channel_number: The channel number for the frames
+        :param method_frame: The method frame to send
+        :param properties: The message properties
+        :param body_size: The length of the message body, in bytes
+        :returns: The method and header frames, in sending order
+        """
+        return [
+            frame.Method(channel_number, method_frame).marshal(),
+            frame.Header(channel_number, body_size, properties).marshal()
+        ]
+
+    def _marshal_body(self, channel_number: int, body: bytes) -> list[bytes]:
+        """
+        Marshal a message body into body frames; see `_marshal_message`.
+
+        :param channel_number: The channel number for the frames
+        :param body: The message body
+        :returns: The body frames, in sending order, or none for an empty body
+        """
+        # memoryview slices share the body, so each fragment is copied once,
+        # into its frame.
+        view = memoryview(body)
+        return [
+            frame.marshal_body(channel_number,
+                               view[start:start + self._body_max_length])
+            for start in range(0, len(body), self._body_max_length)
+        ]
 
     def _set_connection_state(self, connection_state: int) -> None:
         """

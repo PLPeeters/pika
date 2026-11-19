@@ -103,8 +103,10 @@ def test_report_uses_interpolated_quantiles_and_window_throughput():
                                 burst_size=5,
                                 timer_interval=0.001,
                                 sync_work_ms=1.0,
-                                missed_deadlines=1)
+                                missed_deadlines=1,
+                                publish_mode='async')
 
+    assert result['publish_mode'] == 'async'
     assert result['requested_messages'] == 500
     assert result['published'] == 4
     assert result['delivered'] == 3
@@ -220,6 +222,7 @@ def _install_connection(monkeypatch, on_publish):
         def __init__(self, _params, on_open_callback, on_close_callback,
                      **_kwargs):
             self.is_open = True
+            self.async_publishes = 0
             self._transport = _FakeTransport()
             self.channel_instance = Channel()
             self.on_close_callback = on_close_callback
@@ -230,6 +233,13 @@ def _install_connection(monkeypatch, on_publish):
         def channel(self, on_open_callback):
             self.loop.call_soon(on_open_callback, self.channel_instance)
 
+        def publish(self, channel, _exchange, _queue, _body):
+            self.async_publishes += 1
+            accepted = self.loop.create_future()
+            self.loop.call_soon(accepted.set_result, None)
+            self.loop.call_soon(on_publish, channel.consumer)
+            return accepted
+
         def close(self):
             self.is_open = False
             self.loop.call_soon(self.on_close_callback, self,
@@ -239,14 +249,19 @@ def _install_connection(monkeypatch, on_publish):
     return connections
 
 
-def _run_benchmark(messages, rate, duration, timer_interval):
+def _run_benchmark(messages,
+                   rate,
+                   duration,
+                   timer_interval,
+                   publish_mode='sync',
+                   burst_size=1):
 
     async def run():
         loop = asyncio.get_running_loop()
         benchmark = _BENCHMARK._Run(loop,
                                     _BENCHMARK.pika.ConnectionParameters(),
-                                    'sample', messages, 32, rate, 1, duration,
-                                    timer_interval, 0)
+                                    'sample', messages, 32, rate, burst_size,
+                                    duration, timer_interval, 0, publish_mode)
         return await benchmark.run()
 
     return asyncio.run(run())
@@ -299,6 +314,21 @@ def test_delivery_after_the_cutoff_does_not_finish_within_the_window(
     assert result['delivered'] == 1
     assert result['delivered_during_window'] == 0
     assert result['deliveries_finished_within_window'] is False
+
+
+def test_async_mode_publishes_through_the_connection(monkeypatch):
+
+    def deliver(consumer):
+        consumer(None, None, None, b'')
+
+    connections = _install_connection(monkeypatch, deliver)
+
+    result = _run_benchmark(4, 100.0, 0.1, 0.02, 'async', burst_size=2)
+
+    assert result['publish_mode'] == 'async'
+    assert result['published'] == result['delivered'] == 4
+    assert connections[0].async_publishes == 4
+    assert connections[0].is_open is False
 
 
 def test_run_without_timer_samples_fails_and_closes_connection(monkeypatch):

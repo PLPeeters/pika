@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
+import functools
 import logging
 import sys
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
-from pika._utils import override
+from pika import spec
+from pika._utils import as_bytes, override
 from pika.adapters import base_connection
 from pika.adapters.utils import connection_workflow, io_services_utils, nbio_interface
 
 if TYPE_CHECKING:
     from pika import connection
+    from pika.channel import Channel
 
 LOGGER = logging.getLogger(__name__)
+
+# `AsyncioConnection.publish` frames a larger body in the loop's default
+# executor.
+_EXECUTOR_BODY_SIZE = 64 * 1024
+
+# `AsyncioConnection.publish` holds messages while the transport buffers this
+# many bytes or more.
+_WRITE_BUFFER_LIMIT = 1024 * 1024
 
 
 class AsyncioConnection(base_connection.BaseConnection):
@@ -61,6 +74,8 @@ class AsyncioConnection(base_connection.BaseConnection):
             nbio = custom_ioloop
         else:
             nbio = _AsyncioIOServicesAdapter(custom_ioloop)
+
+        self._publisher: _Publisher | None = None
 
         super().__init__(
             parameters,
@@ -109,6 +124,218 @@ class AsyncioConnection(base_connection.BaseConnection):
             nbio=nbio,
             workflow=workflow,
             on_done=on_done)
+
+    def publish(self,
+                channel: Channel,
+                exchange: str,
+                routing_key: str,
+                body: str | bytes,
+                properties: spec.BasicProperties | None = None,
+                mandatory: bool = False) -> asyncio.Future[None]:
+        """
+        Publish to a channel of this connection, framing a large body off the event loop.
+
+        Call it on the event loop's thread, like the rest of this connection's API. The method and
+        properties are encoded before it returns, so the caller may reuse *properties* at once. The
+        body is framed later: in the loop's default executor when it is larger than 64 KiB, on the
+        loop otherwise.
+
+        Messages published through this method are written to the transport in call order, each as
+        one unbroken run of frames, so the messages on a channel are never interleaved. A
+        `Channel.basic_publish` is written at once, so it can overtake messages this method still
+        holds.
+
+        While the transport buffers 1 MiB or more of unsent data, messages wait unframed, so this
+        method's own writes take the buffer past 1 MiB by at most one message. Other writes, such as
+        `Channel.basic_publish`, are not held back. A waiting message keeps its body, so a caller
+        bounds the memory held by awaiting its publishes.
+
+        The returned future resolves to None once the message's frames are in the transport's write
+        buffer, whether or not publisher confirms are enabled; the broker's Basic.Ack or Basic.Nack
+        still arrives through `Channel.confirm_delivery`. Cancelling the future before then
+        withdraws the message.
+
+        Failures are set on the future rather than raised. A message fails with
+        `exceptions.ChannelWrongStateError` if the channel is not open when it is published or when
+        its turn to be written comes, and with the channel's closing reason if it is still waiting
+        when the channel closes. A close the caller starts therefore fails the messages not yet
+        written, so await the futures before calling `Channel.close` or `close`. *body* other than
+        `bytes` or `str` fails with `TypeError`, and the method and properties with whatever
+        encoding them raises, such as `pika.exceptions.UnsupportedAMQPFieldException` for a header
+        value with no field-table type.
+
+        :param channel: An open channel of this connection
+        :param exchange: The exchange to publish to
+        :param routing_key: The routing key to bind on
+        :param body: The message body
+        :param properties: Basic.properties
+        :param mandatory: The mandatory flag
+        :returns: A future that resolves once the message is queued for sending
+        """
+        if self._publisher is None:
+            self._publisher = _Publisher(self)
+        return self._publisher.publish(channel, exchange, routing_key, body,
+                                       properties, mandatory)
+
+
+class _PendingPublish:
+    """A message `AsyncioConnection.publish` has encoded but not yet written."""
+
+    __slots__ = ('body', 'channel', 'future', 'head')
+
+    def __init__(self, channel: Channel, head: list[bytes], body: bytes,
+                 future: asyncio.Future[None]) -> None:
+        """
+        :param channel: The channel to publish on
+        :param head: The marshaled method and header frames
+        :param body: The message body
+        :param future: The future `AsyncioConnection.publish` returned
+        """
+        self.channel = channel
+        self.head = head
+        self.body = body
+        self.future = future
+
+
+class _Publisher:
+    """Writes the messages `AsyncioConnection.publish` accepts, one at a time and in call order."""
+
+    def __init__(self, conn: AsyncioConnection) -> None:
+        """
+        :param conn: The connection to publish on
+        """
+        self._connection = conn
+        self._loop: asyncio.AbstractEventLoop = conn.ioloop
+        self._pending: collections.deque[_PendingPublish] = collections.deque()
+        self._watched_channels: set[Channel] = set()
+        self._capacity: asyncio.Future[None] | None = None
+        self._writer: asyncio.Task[None] | None = None
+
+    def publish(self, channel: Channel, exchange: str, routing_key: str,
+                body: str | bytes, properties: spec.BasicProperties | None,
+                mandatory: bool) -> asyncio.Future[None]:
+        """
+        See `AsyncioConnection.publish`.
+
+        :param channel: An open channel of this connection
+        :param exchange: The exchange to publish to
+        :param routing_key: The routing key to bind on
+        :param body: The message body
+        :param properties: Basic.properties
+        :param mandatory: The mandatory flag
+        :returns: A future that resolves once the message is queued for sending
+        """
+        future: asyncio.Future[None] = self._loop.create_future()
+        try:
+            channel._raise_if_not_open()
+            body = as_bytes(body, 'publish body')
+            head = self._connection._marshal_message_head(
+                channel.channel_number,
+                spec.Basic.Publish(exchange=exchange,
+                                   routing_key=routing_key,
+                                   mandatory=mandatory), properties or
+                spec.BasicProperties(), len(body))
+        except Exception as error:
+            future.set_exception(error)
+            return future
+
+        if channel not in self._watched_channels:
+            self._watched_channels.add(channel)
+            channel.add_on_close_callback(self._on_channel_closed)
+
+        item = _PendingPublish(channel, head, body, future)
+        self._pending.append(item)
+        future.add_done_callback(functools.partial(self._withdraw, item))
+        if self._writer is None:
+            self._writer = self._loop.create_task(self._write_pending())
+        return future
+
+    async def _write_pending(self) -> None:
+        """Write the pending messages in order, holding each until the transport has capacity."""
+        try:
+            while self._pending:
+                transport = self._connection._transport
+                assert isinstance(transport,
+                                  io_services_utils._AsyncTransportBase)
+                if transport.get_write_buffer_size() >= _WRITE_BUFFER_LIMIT:
+                    transport._on_write_progress = self._wake
+                    self._capacity = self._loop.create_future()
+                    await self._capacity
+                    continue
+
+                # The message stays queued while it is framed, so a channel
+                # close or a cancellation in the meantime settles it.
+                item = self._pending[0]
+                if not item.future.done():
+                    await self._write(item)
+                self._discard(item)
+        finally:
+            self._writer = None
+
+    async def _write(self, item: _PendingPublish) -> None:
+        """
+        Frame a message's body and write the message, settling its future.
+
+        :param item: The message
+        """
+        try:
+            if len(item.body) > _EXECUTOR_BODY_SIZE:
+                body_frames = await self._loop.run_in_executor(
+                    None, self._connection._marshal_body,
+                    item.channel.channel_number, item.body)
+            else:
+                body_frames = self._connection._marshal_body(
+                    item.channel.channel_number, item.body)
+            if item.future.done():
+                return
+            item.channel._publish_marshaled(item.head + body_frames)
+        except Exception as error:
+            if not item.future.done():
+                item.future.set_exception(error)
+        else:
+            item.future.set_result(None)
+
+    def _wake(self) -> None:
+        """Let `_write_pending` check the transport and the queue again."""
+        if self._capacity is not None and not self._capacity.done():
+            self._capacity.set_result(None)
+
+    def _withdraw(self, item: _PendingPublish,
+                  future: asyncio.Future[None]) -> None:
+        """
+        Drop a message whose future was cancelled before it was written.
+
+        :param item: The message
+        :param future: Its future, now done
+        """
+        if future.cancelled():
+            self._discard(item)
+
+    def _discard(self, item: _PendingPublish) -> None:
+        """
+        Remove a message from the queue if it is still there.
+
+        :param item: The message
+        """
+        with contextlib.suppress(ValueError):
+            self._pending.remove(item)
+
+    def _on_channel_closed(self, channel: Channel, reason: Exception) -> None:
+        """
+        Fail the messages pending on a channel that closed.
+
+        :param channel: The closed channel
+        :param reason: Why it closed
+        """
+        self._watched_channels.discard(channel)
+        remaining: collections.deque[_PendingPublish] = collections.deque()
+        for item in self._pending:
+            if item.channel is not channel:
+                remaining.append(item)
+            elif not item.future.done():
+                item.future.set_exception(reason)
+        self._pending = remaining
+        self._wake()
 
 
 class _AsyncioIOServicesAdapter(io_services_utils.SocketConnectionMixin,

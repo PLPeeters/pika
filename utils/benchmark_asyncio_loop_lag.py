@@ -11,7 +11,8 @@ seconds; requested messages are capped by the measurement window. To compare 500
 `--rate 25000`, and `--small-bursts 500,50`. Peak queued bytes measure Pika's local asyncio
 transport write buffer, sampled after each publish. Publish and delivery rates divide in-window
 counts by the fixed measurement window; the final delivery count also includes any drain after that
-window.
+window. `--publish async` publishes through `AsyncioConnection.publish` instead of
+`Channel.basic_publish`, awaits each burst, and samples the write buffer after it as well.
 """
 
 from __future__ import annotations
@@ -94,10 +95,13 @@ def _report(samples: list[float], workload: str, requested_messages: int,
             published: int, delivered: int, delivered_in_window: int,
             duration: float, peak_queued_bytes: int, within_window: bool,
             body_size: int, rate: float, burst_size: int, timer_interval: float,
-            sync_work_ms: float, missed_deadlines: int) -> dict[str, Any]:
+            sync_work_ms: float, missed_deadlines: int,
+            publish_mode: str) -> dict[str, Any]:
     return {
         'workload':
             workload,
+        'publish_mode':
+            publish_mode,
         'body_size_bytes':
             body_size,
         'offered_rate_msg_per_s':
@@ -158,11 +162,18 @@ def _transport_write_buffer_size(connection: Any) -> int:
 
 class _Run:
 
-    def __init__(self, loop: asyncio.AbstractEventLoop,
-                 params: pika.ConnectionParameters, workload: str,
-                 messages: int, body_size: int, rate: float, burst_size: int,
-                 duration: float, timer_interval: float,
-                 sync_work_ms: float) -> None:
+    def __init__(self,
+                 loop: asyncio.AbstractEventLoop,
+                 params: pika.ConnectionParameters,
+                 workload: str,
+                 messages: int,
+                 body_size: int,
+                 rate: float,
+                 burst_size: int,
+                 duration: float,
+                 timer_interval: float,
+                 sync_work_ms: float,
+                 publish_mode: str = 'sync') -> None:
         self.loop = loop
         self.params = params
         self.workload = workload
@@ -173,6 +184,7 @@ class _Run:
         self.duration = duration
         self.timer_interval = timer_interval
         self.sync_work_ms = sync_work_ms
+        self.publish_mode = publish_mode
         self.ready = loop.create_future()
         self.failure = loop.create_future()
         self.closed = loop.create_future()
@@ -231,7 +243,8 @@ class _Run:
                            burst_size=self.burst_size,
                            timer_interval=self.timer_interval,
                            sync_work_ms=self.sync_work_ms,
-                           missed_deadlines=self.sampler.missed_deadlines)
+                           missed_deadlines=self.sampler.missed_deadlines,
+                           publish_mode=self.publish_mode)
         finally:
             self.sampler.stop()
             if self.publisher_task is not None and not self.publisher_task.done(
@@ -353,11 +366,22 @@ class _Run:
                 await asyncio.sleep(delay)
             if self.loop.time() >= self.window_end:
                 break
+            accepted = []
             for _ in range(batch):
                 if self.loop.time() >= self.window_end:
                     break
-                self.channel.basic_publish('', self.queue, self.body)
+                if self.publish_mode == 'async':
+                    accepted.append(
+                        self.connection.publish(self.channel, '', self.queue,
+                                                self.body))
+                else:
+                    self.channel.basic_publish('', self.queue, self.body)
                 self.published += 1
+                self.peak_queued_bytes = max(
+                    self.peak_queued_bytes,
+                    _transport_write_buffer_size(self.connection))
+            if accepted:
+                await asyncio.gather(*accepted)
                 self.peak_queued_bytes = max(
                     self.peak_queued_bytes,
                     _transport_write_buffer_size(self.connection))
@@ -415,7 +439,8 @@ async def _run_workload(args: argparse.Namespace,
     loop = asyncio.get_running_loop()
     run = _Run(loop, _params(args), name,
                args.messages if messages is None else messages, body_size,
-               args.rate, burst, args.duration, args.timer_interval, sync_ms)
+               args.rate, burst, args.duration, args.timer_interval, sync_ms,
+               args.publish)
     return await run.run()
 
 
@@ -458,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
                         choices=('all', 'idle', 'small', 'large-single',
                                  'large-burst', 'sync-consumer'),
                         default='all')
+    parser.add_argument('--publish', choices=('sync', 'async'), default='sync')
     parser.add_argument('--messages', type=int, default=DEFAULT_MESSAGES)
     parser.add_argument('--duration', type=float, default=DEFAULT_DURATION)
     parser.add_argument('--rate', type=float, default=DEFAULT_RATE)

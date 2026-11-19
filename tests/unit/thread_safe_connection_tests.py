@@ -86,7 +86,12 @@ def _cancel_ok(consumer_tag):
 
 def _marshal(channel_number, method, content):
     """`Connection._marshal_message` with the default body frame size."""
-    stand_in = type('StandIn', (), {'_body_max_length': 131072 - 8})()
+    stand_in = type(
+        'StandIn', (), {
+            '_body_max_length': 131072 - 8,
+            '_marshal_message_head': _AsyncConnection._marshal_message_head,
+            '_marshal_body': _AsyncConnection._marshal_body
+        })()
     return _AsyncConnection._marshal_message(stand_in, channel_number, method,
                                              content)
 
