@@ -35,6 +35,12 @@ class FrameTests(unittest.TestCase):
         body = frame.Body(1, b'I like it that sound')
         self.assertEqual(body.marshal(), self.BODY_FRAME)
 
+    def test_marshal_body_accepts_memoryview(self):
+        fragment = memoryview(b'xxI like it that soundxx')[2:-2]
+        marshaled = frame.marshal_body(1, fragment)
+        self.assertIsInstance(marshaled, bytes)
+        self.assertEqual(marshaled, self.BODY_FRAME)
+
     def test_heartbeat_marshal(self):
         heartbeat = frame.Heartbeat()
         self.assertEqual(heartbeat.marshal(), self.HEARTBEAT)

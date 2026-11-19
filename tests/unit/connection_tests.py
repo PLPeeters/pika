@@ -1523,7 +1523,53 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(self.connection.frames_sent, frames_sent)
         self.assertEqual(self.connection.bytes_sent, bytes_sent)
 
-    def test_no_side_effects_from_message_marshal_error(self):
+    @mock.patch.object(ConstructibleConnection,
+                       '_adapter_emit_data',
+                       spec_set=connection.Connection._adapter_emit_data)
+    def _published_frames(self, body, _adapter_emit_data):
+        """Return the wire frames `_send_method` writes for a Basic.Publish."""
+        method = spec.Basic.Publish(exchange='my-exchange',
+                                    routing_key='my-route')
+        self.connection._send_method(channel_number=1,
+                                     method=method,
+                                     content=(spec.BasicProperties(), body))
+        return [call[0][0] for call in _adapter_emit_data.call_args_list]
+
+    def test_publish_wire_bytes_across_frame_boundaries(self):
+        frame_max = 8192
+        self.connection.params.frame_max = frame_max
+        self.connection._body_max_length = (
+            self.connection._get_body_frame_max_length())
+        max_body = frame_max - spec.FRAME_HEADER_SIZE - spec.FRAME_END_SIZE
+        self.assertEqual(frame_max - 8, max_body)
+
+        method = spec.Basic.Publish(exchange='my-exchange',
+                                    routing_key='my-route')
+        sizes = (0, 1, max_body - 1, max_body, max_body + 1, 2 * max_body,
+                 2 * max_body + 1, 5 * max_body + 7)
+        for size in sizes:
+            # A distinct byte per offset shows misordered or shifted fragments.
+            body = bytes(i % 251 for i in range(size))
+            expected = [
+                frame.Method(1, method).marshal(),
+                frame.Header(1, size, spec.BasicProperties()).marshal()
+            ]
+            for start in range(0, size, max_body):
+                fragment = body[start:start + max_body]
+                expected.append(
+                    struct.pack('>BHI', spec.FRAME_BODY, 1, len(fragment)) +
+                    fragment + b'\xce')
+
+            with self.subTest(size=size):
+                frames = self._published_frames(body)
+                self.assertEqual(expected, frames)
+                self.assertTrue(all(isinstance(f, bytes) for f in frames))
+
+    @mock.patch.object(ConstructibleConnection,
+                       '_adapter_emit_data',
+                       spec_set=connection.Connection._adapter_emit_data)
+    def test_no_side_effects_from_message_marshal_error(self,
+                                                        _adapter_emit_data):
         # Verify that frame buffer is empty on entry
         self.assertEqual(b'', self.connection._frame_buffer)
 
@@ -1549,3 +1595,6 @@ class ConnectionTests(unittest.TestCase):
 
         # Now make sure that nothing is enqueued on frame buffer
         self.assertEqual(b'', self.connection._frame_buffer)
+        _adapter_emit_data.assert_not_called()
+        self.assertEqual(0, self.connection.frames_sent)
+        self.assertEqual(0, self.connection.bytes_sent)

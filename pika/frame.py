@@ -156,7 +156,19 @@ class Body(Frame):
     @override
     def marshal(self) -> bytes:
         """Return the AMQP binary encoded value of the frame."""
-        return self._marshal([self.fragment])
+        return marshal_body(self.channel_number, self.fragment)
+
+
+def marshal_body(channel_number: int, fragment: bytes | memoryview) -> bytes:
+    """
+    Return the AMQP binary encoded value of a body frame for a `bytes` or `memoryview` fragment.
+
+    :param channel_number: The channel number for the frame
+    :param fragment: The fragment of the body
+    """
+    return b''.join(
+        (_FRAME_HEADER.pack(spec.FRAME_BODY, channel_number,
+                            len(fragment)), fragment, _FRAME_END_BYTE))
 
 
 class Heartbeat(Frame):

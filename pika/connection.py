@@ -7,7 +7,6 @@ import ast
 import copy
 import functools
 import logging
-import math
 import numbers
 import platform
 import ssl
@@ -2570,13 +2569,13 @@ class Connection(abc.ABC):
         marshaled_body_frames.append(frame_header.marshal())
 
         if content[1]:
-            chunks = math.ceil(float(length) / self._body_max_length)
-            for chunk in range(chunks):
-                start = chunk * self._body_max_length
-                end = start + self._body_max_length
-                end = min(end, length)
-                frame_body = frame.Body(channel_number, content[1][start:end])
-                marshaled_body_frames.append(frame_body.marshal())
+            # memoryview slices share the body, so each fragment is copied
+            # once, into its frame.
+            body = memoryview(content[1])
+            for start in range(0, length, self._body_max_length):
+                fragment = body[start:start + self._body_max_length]
+                marshaled_body_frames.append(
+                    frame.marshal_body(channel_number, fragment))
 
         return marshaled_body_frames
 
