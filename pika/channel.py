@@ -5,6 +5,7 @@ behaviors for an AMQP Channel.
 from __future__ import annotations
 
 import functools
+import io
 import logging
 import uuid
 from collections import deque
@@ -1757,7 +1758,7 @@ class ContentFrameAssembler:
         self._method_frame: frame.Method | None = None
         self._header_frame: frame.Header | None = None
         self._seen_so_far = 0
-        self._body_fragments: list[bytes] = []
+        self._body: bytes | io.BytesIO | None = None
 
     def process(
         self, frame_value: frame.Frame
@@ -1790,8 +1791,13 @@ class ContentFrameAssembler:
         """Invoked when all of the message has been received."""
         assert self._method_frame is not None
         assert self._header_frame is not None
-        content = (self._method_frame, self._header_frame,
-                   b''.join(self._body_fragments))
+        if self._body is None:
+            body = b''
+        elif isinstance(self._body, bytes):
+            body = self._body
+        else:
+            body = self._body.getvalue()
+        content = (self._method_frame, self._header_frame, body)
         self._reset()
         return content
 
@@ -1807,13 +1813,21 @@ class ContentFrameAssembler:
         :raises: pika.exceptions.BodyTooLongError
         """
         self._seen_so_far += len(body_frame.fragment)
-        self._body_fragments.append(body_frame.fragment)
         assert self._header_frame is not None
-        if self._seen_so_far == self._header_frame.body_size:
-            return self._finish()
         if self._seen_so_far > self._header_frame.body_size:
             raise exceptions.BodyTooLongError(self._seen_so_far,
                                               self._header_frame.body_size)
+        if self._body is None:
+            self._body = body_frame.fragment
+        elif isinstance(self._body, bytes):
+            body = io.BytesIO()
+            body.write(self._body)
+            body.write(body_frame.fragment)
+            self._body = body
+        else:
+            self._body.write(body_frame.fragment)
+        if self._seen_so_far == self._header_frame.body_size:
+            return self._finish()
         return None
 
     def _reset(self) -> None:
@@ -1821,4 +1835,4 @@ class ContentFrameAssembler:
         self._method_frame = None
         self._header_frame = None
         self._seen_so_far = 0
-        self._body_fragments = []
+        self._body = None

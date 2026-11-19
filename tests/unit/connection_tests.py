@@ -1068,6 +1068,77 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(bytearray(), self.connection._frame_buffer)
         self.assertFalse(self.connection._processing_frame_buffer)
 
+    def test_inbound_delivery_bodies_interleave_across_split_body_reads(self):
+        assemblers = {
+            1: channel.ContentFrameAssembler(),
+            2: channel.ContentFrameAssembler()
+        }
+        delivered = []
+
+        class ChannelProxy:
+
+            def __init__(self, assembler, channel_number):
+                self.assembler = assembler
+                self.channel_number = channel_number
+
+            def _handle_content_frame(self, frame_value):
+                result = self.assembler.process(frame_value)
+                if result is not None:
+                    delivered.append((self.channel_number, result[2]))
+
+        self.connection._channels = {
+            number: ChannelProxy(assembler, number)
+            for number, assembler in assemblers.items()
+        }
+
+        def content_start(channel_number, body_size):
+            return b''.join((
+                frame.Method(channel_number,
+                             spec.Basic.Deliver('ctag', 1, False, '',
+                                                'q')).marshal(),
+                frame.Header(channel_number, body_size,
+                             spec.BasicProperties()).marshal(),
+            ))
+
+        empty_delivery = content_start(1, 0)
+        single_body = b'one!'
+        single_body_frame = frame.Body(1, single_body).marshal()
+        self.connection._on_data_available(empty_delivery)
+        self.assertEqual([(1, b'')], delivered)
+        single_body_start = content_start(1, len(single_body))
+        self.connection._on_data_available(single_body_start +
+                                           single_body_frame[:9])
+        self.assertEqual([(1, b'')], delivered)
+        self.connection._on_data_available(single_body_frame[9:])
+        self.assertEqual([(1, b''), (1, single_body)], delivered)
+        retained_single_body = delivered[-1][1]
+
+        first_fragment = frame.Body(1, b'ab').marshal()
+        second_fragment = frame.Body(2, b'xyz').marshal()
+        first_final_fragment = frame.Body(1, b'cd').marshal()
+        second_final_fragment = frame.Body(2, b'123').marshal()
+
+        self.connection._on_data_available(
+            content_start(1, 4) + first_fragment[:8])
+        self.connection._on_data_available(first_fragment[8:] +
+                                           content_start(2, 6) +
+                                           second_fragment)
+        self.assertEqual([(1, b''), (1, single_body)], delivered)
+
+        self.connection._on_data_available(first_final_fragment)
+        self.assertEqual([(1, b''), (1, single_body), (1, b'abcd')], delivered)
+        retained_multiframe_body = delivered[-1][1]
+
+        self.connection._on_data_available(second_final_fragment[:9])
+        self.assertEqual([(1, b''), (1, single_body), (1, b'abcd')], delivered)
+        self.connection._on_data_available(second_final_fragment[9:])
+
+        self.assertEqual([(1, b''), (1, single_body), (1, b'abcd'),
+                          (2, b'xyz123')], delivered)
+        self.assertEqual(single_body, retained_single_body)
+        self.assertEqual(b'abcd', retained_multiframe_body)
+        self.assertTrue(all(type(body) is bytes for _, body in delivered))
+
     def _feed_with_real_terminate(self, data):
         """Feed *data* with the real `_terminate_stream`, stubbing only the transport teardown."""
         with mock.patch.object(self.connection, '_adapter_disconnect_stream'):
@@ -1099,12 +1170,24 @@ class ConnectionTests(unittest.TestCase):
 
     def test_message_body_at_the_limit_is_accepted(self):
         self.connection.params.max_inbound_message_body_size = 1024
-        header = frame.Header(1, 1024, spec.BasicProperties()).marshal()
+        body = b'x' * 1024
+        method = frame.Method(1, spec.Basic.Deliver('ctag', 1, False, '',
+                                                    'q')).marshal()
+        header = frame.Header(1, len(body), spec.BasicProperties()).marshal()
+        body_frame = frame.Body(1, body).marshal()
+        assembler = channel.ContentFrameAssembler()
+        delivered = []
 
-        self._feed_with_real_terminate(header)
+        def handle_content_frame(frame_value):
+            result = assembler.process(frame_value)
+            if result is not None:
+                delivered.append(result[2])
+
+        self.channel._handle_content_frame.side_effect = handle_content_frame
+        self._feed_with_real_terminate(method + header + body_frame)
 
         self.assertIsNone(self.connection._error)
-        self.assertEqual(1, self.channel._handle_content_frame.call_count)
+        self.assertEqual([body], delivered)
 
     def test_oversized_frame_ends_the_connection_before_its_payload_arrives(
             self):
