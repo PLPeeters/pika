@@ -689,6 +689,7 @@ class _AsyncTransportBase(AbstractStreamTransport):
     _STATE_COMPLETED = 4  # done with connection
 
     _MAX_RECV_BYTES = 1024 * 64
+    _MAX_COALESCED_WRITE_BYTES = 1024 * 64
 
     # Max per consume call to prevent event starvation
     _MAX_CONSUME_BYTES = 1024 * 100
@@ -720,6 +721,7 @@ class _AsyncTransportBase(AbstractStreamTransport):
         self._state = self._STATE_ACTIVE
         self._tx_buffers: collections.deque[bytes] = collections.deque()
         self._tx_buffered_byte_count = 0
+        self._tx_buffer_pinned = False
         # Called after each attempt to send; see `AsyncioConnection.publish`.
         self._on_write_progress: Callable[[], None] | None = None
 
@@ -829,7 +831,10 @@ class _AsyncTransportBase(AbstractStreamTransport):
 
         try:
             while self._tx_buffers:
+                if not self._tx_buffer_pinned:
+                    self._coalesce_tx_buffers()
                 num_bytes_sent = self._sock.send(self._tx_buffers[0])
+                self._tx_buffer_pinned = False
 
                 chunk = self._tx_buffers.popleft()
                 if num_bytes_sent < len(chunk):
@@ -846,6 +851,27 @@ class _AsyncTransportBase(AbstractStreamTransport):
             # Sending usually stops with a "try again" error.
             if self._on_write_progress is not None:
                 self._on_write_progress()
+
+    def _coalesce_tx_buffers(self) -> None:
+        """Coalesce queued chunks without splitting an existing frame."""
+        first = self._tx_buffers[0]
+        if len(first) > self._MAX_COALESCED_WRITE_BYTES:
+            return
+
+        chunks = [first]
+        byte_count = len(first)
+        buffers = iter(self._tx_buffers)
+        next(buffers)
+        for next_chunk in buffers:
+            if byte_count + len(next_chunk) > self._MAX_COALESCED_WRITE_BYTES:
+                break
+            chunks.append(next_chunk)
+            byte_count += len(next_chunk)
+
+        if len(chunks) > 1:
+            for _ in chunks:
+                self._tx_buffers.popleft()
+            self._tx_buffers.appendleft(b''.join(chunks))
 
     @_log_exceptions
     def _deactivate(self) -> None:
@@ -1304,9 +1330,11 @@ class _AsyncSSLTransport(_AsyncTransportBase):
         except ssl.SSLError as error:
             if error.errno == ssl.SSL_ERROR_WANT_READ:
                 # Looks like SSL re-negotiation
+                self._tx_buffer_pinned = True
                 _LOGGER.debug('SSL emitter wants read: %s', self._sock)
                 next_produce_on_writable = False
             elif error.errno == ssl.SSL_ERROR_WANT_WRITE:
+                self._tx_buffer_pinned = True
                 _LOGGER.debug('SSL emitter wants write: %s', self._sock)
                 next_produce_on_writable = True
             else:
